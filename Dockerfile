@@ -1,58 +1,83 @@
-# Stage 1: Builder (Igual ao seu)
-FROM php:8.2-fpm-alpine AS builder
+# ==============================================================================
+# ESTÁGIO 1: Construção do Front-end (Node.js)
+# ==============================================================================
+FROM node:20-alpine AS node_builder
+WORKDIR /app
+# Copia arquivos de dependência primeiro (cache eficiente)
+COPY package.json package-lock.json ./
+# Se não tiver package-lock.json, remove a linha acima e usa apenas package.json
+# RUN npm ci --quiet  <-- Use 'ci' se tiver package-lock, senão use 'install'
+RUN npm install 
+COPY . .
+# Gera os arquivos estáticos em /app/public/build
+RUN npm run build
+
+# ==============================================================================
+# ESTÁGIO 2: Construção do Back-end (Composer)
+# ==============================================================================
+FROM php:8.2-fpm-alpine AS composer_builder
 WORKDIR /var/www/html
 COPY --from=composer:latest /usr/bin/composer /usr/local/bin/composer
 COPY composer.json composer.lock ./
-RUN apk add --no-cache --virtual .build-deps \
-    libzip-dev libpng-dev libjpeg-turbo-dev zlib-dev linux-headers \
-    && docker-php-ext-configure gd --with-jpeg \
-    && docker-php-ext-install -j$(nproc) pdo_mysql opcache bcmath zip gd sockets exif pcntl pdo
+# Instala libs do sistema necessárias para o composer instalar deps
+RUN apk add --no-cache libzip-dev libpng-dev
 RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
-COPY . .
-RUN composer dump-autoload --optimize
 
-# Stage 2: Produção (Com Nginx + Supervisor)
+# ==============================================================================
+# ESTÁGIO 3: Imagem Final de Produção
+# ==============================================================================
 FROM php:8.2-fpm-alpine
 
 ENV TZ=America/Sao_Paulo
 
-# 1. Instala Nginx e Supervisor
+# 1. Instala Nginx, Supervisor e Dependências de Runtime
 RUN apk add --no-cache \
     nginx \
     supervisor \
-    libzip libpng libjpeg-turbo mysql-client tzdata \
+    libzip \
+    libpng \
+    libjpeg-turbo \
+    mysql-client \
+    tzdata \
+    icu-libs \
     && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     && echo $TZ > /etc/timezone
 
-# 2. Copia extensões do Builder
-COPY --from=builder /usr/local/lib/php/extensions/ /usr/local/lib/php/extensions/
-COPY --from=builder /usr/local/etc/php/conf.d/ /usr/local/etc/php/conf.d/
+# 2. Instala extensões PHP necessárias
+RUN docker-php-ext-install pdo pdo_mysql bcmath opcache zip gd
 
-# 3. Configurações
-WORKDIR /var/www/html
-COPY --from=builder /var/www/html /var/www/html
-
-# Cria usuário Laravel
+# 3. Cria usuário Laravel
 RUN addgroup -g 1000 laravel && adduser -D -u 1000 -G laravel laravel
 
-# Permissões
+# 4. Configura Workdir
+WORKDIR /var/www/html
+
+# 5. COPIA OS ARQUIVOS DA APLICAÇÃO
+COPY . .
+
+# 6. COPIA DEPENDÊNCIAS DO COMPOSER (Do estágio 2)
+COPY --from=composer_builder /var/www/html/vendor ./vendor
+
+# 7. COPIA ASSETS COMPILADOS DO NODE (Do estágio 1) - O PULO DO GATO 🐈
+COPY --from=node_builder /app/public/build ./public/build
+
+# 8. Permissões e Configurações Finais
 RUN mkdir -p storage/framework/{cache,sessions,views} storage/logs bootstrap/cache \
     && chown -R laravel:laravel storage bootstrap/cache \
     && chmod -R 775 storage bootstrap/cache
 
-# 4. Configuração do Nginx (Cria diretórios necessários)
+# Cria diretórios de log do Nginx
 RUN mkdir -p /run/nginx /var/log/nginx
 
-# 5. Copia arquivos de configuração (VOCÊ PRECISA CRIAR ESSES ARQUIVOS NO REPO)
+# Copia configurações (Certifique-se que estes arquivos existem no seu repo!)
 COPY docker/nginx.conf /etc/nginx/http.d/default.conf
 COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 COPY docker/php/php.ini /usr/local/etc/php/conf.d/custom.ini
 
-# 6. Ajusta PHP-FPM para rodar como 'laravel' mas o processo pai será root (Supervisor)
+# Ajusta usuário do PHP-FPM
 RUN sed -i 's/user = www-data/user = laravel/g' /usr/local/etc/php-fpm.d/www.conf \
     && sed -i 's/group = www-data/group = laravel/g' /usr/local/etc/php-fpm.d/www.conf
 
 EXPOSE 80
 
-# O Supervisor inicia o Nginx e o PHP
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
